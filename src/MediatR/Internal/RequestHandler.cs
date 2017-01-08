@@ -1,8 +1,7 @@
-using System.Collections.ObjectModel;
-
 namespace MediatR.Internal
 {
     using System;
+    using System.Collections.ObjectModel;
     using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
@@ -64,9 +63,6 @@ namespace MediatR.Internal
     internal class RequestHandlerImpl<TRequest, TResponse> : RequestHandler<TResponse>
         where TRequest : IRequest<TResponse>
     {
-        private Func<TRequest, CancellationToken, SingleInstanceFactory, RequestHandlerDelegate<TResponse>> _handlerFactory;
-        private object _syncLock = new object();
-
         public override Task<TResponse> Handle(IRequest<TResponse> request, CancellationToken cancellationToken,
             SingleInstanceFactory singleFactory, MultiInstanceFactory multiFactory)
         {
@@ -79,51 +75,26 @@ namespace MediatR.Internal
 
         private RequestHandlerDelegate<TResponse> GetHandler(TRequest request, CancellationToken cancellationToken, SingleInstanceFactory factory)
         {
-            var initialized = false;
-
-            var resolveExceptions = new Collection<Exception>();
-            LazyInitializer.EnsureInitialized(ref _handlerFactory, ref initialized, ref _syncLock,
-                () => GetHandlerFactory(factory, ref resolveExceptions));
-
-            if (!initialized || _handlerFactory == null)
+			var resolveExceptions = new Collection<Exception>();
+            var handler = GetHandler<IRequestHandler<TRequest, TResponse>>(factory, ref resolveExceptions);
+            if (handler != null)
             {
-                throw BuildException(request, resolveExceptions);
+                return () => Task.FromResult(handler.Handle(request));
             }
 
-            return _handlerFactory(request, cancellationToken, factory);
-        }
-
-        private static Func<TRequest, CancellationToken, SingleInstanceFactory, RequestHandlerDelegate<TResponse>>
-            GetHandlerFactory(SingleInstanceFactory factory, ref Collection<Exception> resolveExceptions)
-        {
-            if (GetHandler<IRequestHandler<TRequest, TResponse>>(factory, ref resolveExceptions) != null)
+            var asyncHandler = GetHandler<IAsyncRequestHandler<TRequest, TResponse>>(factory, ref resolveExceptions);
+            if (asyncHandler != null)
             {
-                return (request, token, fac) => () =>
-                {
-                    var handler = GetHandler<IRequestHandler<TRequest, TResponse>>(fac);
-                    return Task.FromResult(handler.Handle(request));
-                };
+                return () => asyncHandler.Handle(request);
             }
 
-            if (GetHandler<IAsyncRequestHandler<TRequest, TResponse>>(factory, ref resolveExceptions) != null)
+            var cancellableAsyncHandler = GetHandler<ICancellableAsyncRequestHandler<TRequest, TResponse>>(factory, ref resolveExceptions);
+            if (cancellableAsyncHandler != null)
             {
-                return (request, token, fac) =>
-                {
-                    var handler = GetHandler<IAsyncRequestHandler<TRequest, TResponse>>(fac);
-                    return () => handler.Handle(request);
-                };
+                return () => cancellableAsyncHandler.Handle(request, cancellationToken);
             }
 
-            if (GetHandler<ICancellableAsyncRequestHandler<TRequest, TResponse>>(factory, ref resolveExceptions) != null)
-            {
-                return (request, token, fac) =>
-                {
-                    var handler = GetHandler<ICancellableAsyncRequestHandler<TRequest, TResponse>>(fac);
-                    return () => handler.Handle(request, token);
-                };
-            }
-
-            return null;
+            throw BuildException(request, resolveExceptions);
         }
 
         private static Task<TResponse> GetPipeline(TRequest request, RequestHandlerDelegate<TResponse> invokeHandler, MultiInstanceFactory factory)
@@ -141,9 +112,6 @@ namespace MediatR.Internal
     internal class RequestHandlerImpl<TRequest> : RequestHandler
         where TRequest : IRequest
     {
-        private Func<TRequest, CancellationToken, SingleInstanceFactory, RequestHandlerDelegate<Unit>> _handlerFactory;
-        private object _syncLock = new object();
-
         public override Task Handle(IRequest request, CancellationToken cancellationToken,
             SingleInstanceFactory singleFactory, MultiInstanceFactory multiFactory)
         {
@@ -154,53 +122,40 @@ namespace MediatR.Internal
             return pipeline;
         }
 
-        private RequestHandlerDelegate<Unit> GetHandler(TRequest request, CancellationToken cancellationToken, SingleInstanceFactory singleInstanceFactory)
+        private RequestHandlerDelegate<Unit> GetHandler(TRequest request, CancellationToken cancellationToken, SingleInstanceFactory factory)
         {
-            var initialized = false;
-
             var resolveExceptions = new Collection<Exception>();
-            LazyInitializer.EnsureInitialized(ref _handlerFactory, ref initialized, ref _syncLock,
-                () => GetHandlerFactory(singleInstanceFactory, ref resolveExceptions));
-
-            if (!initialized || _handlerFactory == null)
+            var handler = GetHandler<IRequestHandler<TRequest>>(factory, ref resolveExceptions);
+            if (handler != null)
             {
-                throw BuildException(request, resolveExceptions);
+                return () =>
+                    {
+                        handler.Handle(request);
+                        return Unit.Task;
+                    };
             }
 
-            return _handlerFactory(request, cancellationToken, singleInstanceFactory);
-        }
+            var asyncHandler = GetHandler<IAsyncRequestHandler<TRequest>>(factory, ref resolveExceptions);
+            if (asyncHandler != null)
+            {
+                return async () =>
+                    {
+                        await asyncHandler.Handle(request).ConfigureAwait(false);
+                        return Unit.Value;
+                    };
+            }
 
-        private static Func<TRequest, CancellationToken, SingleInstanceFactory, RequestHandlerDelegate<Unit>>
-            GetHandlerFactory(SingleInstanceFactory factory, ref Collection<Exception> resolveExceptions)
-        {
-            if (GetHandler<IRequestHandler<TRequest>>(factory, ref resolveExceptions) != null)
+            var cancellableAsyncHandler = GetHandler<ICancellableAsyncRequestHandler<TRequest>>(factory, ref resolveExceptions);
+            if (cancellableAsyncHandler != null)
             {
-                return (request, token, fac) => () =>
-                {
-                    var handler = GetHandler<IRequestHandler<TRequest>>(fac);
-                    handler.Handle(request);
-                    return Task.FromResult(Unit.Value);
-                };
+                return async () =>
+                    {
+                        await cancellableAsyncHandler.Handle(request, cancellationToken).ConfigureAwait(false);
+                        return Unit.Value;
+                    };
             }
-            if (GetHandler<IAsyncRequestHandler<TRequest>>(factory, ref resolveExceptions) != null)
-            {
-                return (request, token, fac) => async () =>
-                {
-                    var handler = GetHandler<IAsyncRequestHandler<TRequest>>(fac);
-                    await handler.Handle(request).ConfigureAwait(false);
-                    return Unit.Value;
-                };
-            }
-            if (GetHandler<ICancellableAsyncRequestHandler<TRequest>>(factory, ref resolveExceptions) != null)
-            {
-                return (request, token, fac) => async () =>
-                {
-                    var handler = GetHandler<ICancellableAsyncRequestHandler<TRequest>>(fac);
-                    await handler.Handle(request, token).ConfigureAwait(false);
-                    return Unit.Value;
-                };
-            }
-            return null;
+
+            throw BuildException(request, resolveExceptions);
         }
 
         private static Task<Unit> GetPipeline(TRequest request, RequestHandlerDelegate<Unit> invokeHandler, MultiInstanceFactory factory)
